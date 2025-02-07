@@ -1,0 +1,194 @@
+networks:
+  local_ai:
+
+x-ollama: &service-ollama
+  image: ollama/ollama:latest
+  container_name: ollama
+  restart: unless-stopped
+  networks: 
+    - 'local_ai'
+  ports:
+    - 11434:11434
+  volumes:
+    - ./ollama_storage:/root/.ollama
+
+x-init-ollama: &init-ollama
+  image: ollama/ollama:latest
+  container_name: ollama-pull-llama
+  networks: 
+    - 'local_ai'
+  volumes:
+    - ./ollama_storage:/root/.ollama
+  entrypoint: /bin/sh
+  command:
+    - "-c"
+    - "sleep 3; OLLAMA_HOST=ollama:11434 ollama pull llama3.3; OLLAMA_HOST=ollama:11434 ollama pull nomic-embed-text"
+
+x-sd-webui: &service-sd-webui
+  build:
+    context: ./AUTOMATIC1111/
+    dockerfile: Dockerfile
+  container_name: sd-webui
+  restart: unless-stopped  
+  networks: 
+    - 'local_ai'
+  ports:
+    - 7860:7860
+  volumes:
+    - ./sd-webui/external:/stable-diffusion-webui/external
+    - ./sd-webui/output:/output
+    - ./sd-webui/config:/data/config
+    - ./sd-webui/models:/data/models
+    - ./sd-webui/embeddings:/data/embeddings
+    - ./sd-webui/extensions:/data/config/auto/extensions
+
+services:
+
+  ## Open Web UI Services
+
+  chroma-db:
+    image: ghcr.io/chroma-core/chroma:latest
+    container_name: chroma-db
+    restart: unless-stopped
+    networks:
+      - 'local_ai'
+    ports:
+      - 8888:8000
+    environment:
+      - ALLOW_RESET=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - IS_PERSISTENT=TRUE
+    volumes:
+      - ./chroma-storage:/chroma/chroma/
+    healthcheck: 
+      test: ["CMD-SHELL", "curl localhost:8000/api/v1/heartbeat || exit 1"]
+      interval: 10s
+      retries: 2
+      start_period: 5s
+      timeout: 10s
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    depends_on:
+      - chroma-db
+    restart: unless-stopped
+    networks: 
+      - 'local_ai'
+    ports:
+      - 3000:8080
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - DEFAULT_LOCALE=en
+      - DATA_DIR=/app/backend/data  
+      - WEBUI_NAME=Awesome ChatBot
+      - ENABLE_SIGNUP=true
+      - OLLAMA_BASE_URL=http://ollama:11434
+
+      # Chroma DB Configuration
+      - CHROMA_HTTP_HOST=chroma-db
+      - CHROMA_HTTP_PORT=8000
+      - CHROMA_TENANT=default_tenant
+      - VECTOR_DB=chroma
+      - RAG_EMBEDDING_ENGINE=ollama
+      - RAG_EMBEDDING_MODEL=nomic-embed-text-v1.5
+      - RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE=true
+      
+      # Whisper Configuration (commented out as using built-in)
+      # - USE_CUDA_DOCKER=true # Local Whisper
+      # - WHISPER_BASE_URL=http://faster-whisper:10300/
+
+      # Stable Diffusion Configuration
+      - IMAGE_GENERATION_ENGINE=automatic1111
+      - AUTOMATIC1111_BASE_URL=http://sd-webui:7860
+      - ENABLE_IMAGE_GENERATION=true
+      - IMAGE_GENERATION_MODEL=v1-5-pruned-emaonly
+      - IMAGE_SIZE=640x800
+      - AUTOMATIC1111_NEGATIVE_PROMPT=ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft
+      - AUTOMATIC1111_STEPS=20
+      - AUTOMATIC1111_CFG_SCALE=7
+      - AUTOMATIC1111_SAMPLER_NAME=DPM++ 2M Karras
+      - AUTOMATIC1111_ENABLE_HR=true
+      - AUTOMATIC1111_HR_SCALE=2
+      - AUTOMATIC1111_HR_UPSCALER=R-ESRGAN 4x+
+      - AUTOMATIC1111_RESTORE_FACES=true
+    volumes:
+      - ./open-webui:/app/backend/data
+
+  ## Ollama Services
+
+  ollama-cpu:
+    profiles: ["cpu"]
+    <<: *service-ollama
+
+  ollama-gpu:
+    profiles: ["gpu"]
+    <<: *service-ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  ollama-pull-llama-cpu:
+    profiles: ["cpu"]
+    <<: *init-ollama
+    depends_on:
+      - ollama-cpu
+
+  ollama-pull-llama-gpu:
+    profiles: ["gpu"]
+    <<: *init-ollama
+    depends_on:
+      - ollama-gpu
+
+  ## Stable Diffusion Web UI
+
+  sd-webui-cpu:
+    profiles: ["cpu"]
+    <<: *service-sd-webui
+    environment:
+      - "CLI_ARGS=--no-half --precision full --allow-code --enable-insecure-extension-access --api"
+
+  sd-webui-gpu:
+    profiles: ["gpu"]
+    <<: *service-sd-webui
+    environment:
+      - "CLI_ARGS=--allow-code --medvram --xformers --enable-insecure-extension-access --api"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ## Whisper Services Integrated in Open Web UI
+
+  # faster-whisper:
+  #   image: lscr.io/linuxserver/faster-whisper:latest
+  #   container_name: faster-whisper
+  #   restart: unless-stopped
+  #   networks: 
+  #     - 'local_ai'
+  #   ports:
+  #     - 10300:10300
+  #   environment:
+  #     - PUID=1000
+  #     - PGID=1000
+  #     - TZ=Etc/UTC
+  #     - WHISPER_MODEL=tiny-int8
+  #     # - WHISPER_BEAM=1 #optional
+  #     # - WHISPER_LANG=en #optional
+  #   volumes:
+  #     - ./faster-whisper/data:/config
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
